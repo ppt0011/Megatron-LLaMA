@@ -17,8 +17,10 @@ from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 
+from data_utils import RandomDataset
 
-def model_provider(pre_process=True, post_process=True):
+
+def model_provider(pre_process=False, post_process=True):
     """Build the model."""
 
     print_rank_0('building LLaMA model ...')
@@ -37,7 +39,8 @@ def get_batch(data_iterator):
     tokenizer = get_tokenizer()
 
     # Items and their type.
-    keys = ['text']
+    #keys = ['text']
+    keys = ["input_ids", "attention_mask", "labels"]
     datatype = torch.int64
 
     # Broadcast data.
@@ -47,20 +50,33 @@ def get_batch(data_iterator):
         data = None
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
+    #'''
+    tokens = data_b['input_ids'].long().view(args.micro_batch_size, -1)
+    #tokens = data_b['input_ids'].long()
+    #print(f"tokens: {tokens}")
+    #raise Exception("stop here 1")
+    attention_mask = data_b['attention_mask'].long().view(args.micro_batch_size, -1)
+    labels = data_b['labels'].long().view(args.micro_batch_size, -1)
+    return tokens, labels, None, attention_mask, None
+    #'''
+    
+
+    # Get the masks and postition ids.
+    '''
     # Unpack.
     tokens_ = data_b['text'].long()
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
-
-    # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
         args.eod_mask_loss)
+    
 
     return tokens, labels, loss_mask, attention_mask, position_ids
+    '''
 
 def loss_func(loss_mask, output_tensor):
     loss = output_tensor.float()
@@ -90,7 +106,7 @@ def forward_step(data_iterator, model):
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
-
+    '''
     print_rank_0('> building train, validation, and test datasets '
                  'for LLaMA ...')
     train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
@@ -105,8 +121,21 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         valid_data_prefix=args.valid_data_path,
         test_data_prefix=args.test_data_path)
     print_rank_0("> finished creating LLaMA datasets ...")
-
     return train_ds, valid_ds, test_ds
+    '''
+    #'''
+    train_ds = RandomDataset(
+        num_samples=args.micro_batch_size * args.train_iters * torch.cuda.device_count(), max_length=args.seq_length, vocab_size=32001
+    )
+    valid_ds = RandomDataset(
+        num_samples=args.micro_batch_size * args.train_iters * torch.cuda.device_count() * 2, max_length=args.seq_length, vocab_size=32001
+    )
+    test_ds = RandomDataset(
+        num_samples=args.micro_batch_size * args.train_iters * torch.cuda.device_count() * 3, max_length=args.seq_length, vocab_size=32001
+    )
+    return train_ds, valid_ds, test_ds
+    #'''
+
 
 
 if __name__ == "__main__":

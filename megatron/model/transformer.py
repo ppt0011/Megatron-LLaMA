@@ -6,6 +6,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 from typing import Optional
+import time
 
 from megatron import get_timers, get_args, core, get_num_microbatches
 from .module import MegatronModule
@@ -24,9 +25,9 @@ except ImportError:
     rearrange = None
 
 try:
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_func
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
 except ImportError:
-    flash_attn_unpadded_func = None
+    flash_attn_varlen_func = None
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -261,12 +262,19 @@ class CoreAttention(MegatronModule):
                        key_layer.size(0))
 
         # [sq, b, np, hn] -> [sq, b * np, hn]
+        
         query_layer = query_layer.view(output_size[2],
                                        output_size[0] * output_size[1], -1)
         # [sk, b, np, hn] -> [sk, b * np, hn]
         key_layer = key_layer.view(output_size[3],
                                    output_size[0] * output_size[1], -1)
-
+        '''
+        query_layer = query_layer.reshape(output_size[2],
+                                       output_size[0] * output_size[1], -1)
+        # [sk, b, np, hn] -> [sk, b * np, hn]
+        key_layer = key_layer.reshape(output_size[3],
+                                   output_size[0] * output_size[1], -1)
+        '''
         # preallocting input tensor: [b * np, sq, sk]
         matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
             (output_size[0]*output_size[1], output_size[2], output_size[3]),
@@ -349,7 +357,7 @@ class FlashSelfAttention(torch.nn.Module):
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
                  device=None, dtype=None):
         super().__init__()
-        assert flash_attn_unpadded_func is not None, ('Please install FlashAttention first, '
+        assert flash_attn_varlen_func is not None, ('Please install FlashAttention first, '
                                                       'e.g., with pip install flash-attn')
         assert rearrange is not None, 'Please install einops first, e.g., with pip install einops'
         self.causal = causal
@@ -370,6 +378,8 @@ class FlashSelfAttention(torch.nn.Module):
         seqlen_k = k.shape[1]
 
         q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
+        # correct q shape: torch.Size([4096, 32, 128])
+
         cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
                                     device=q.device)
 
@@ -386,8 +396,7 @@ class FlashSelfAttention(torch.nn.Module):
             cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32,
                         device=q.device)
             self.dropout_p = 0
-
-        output = flash_attn_unpadded_func(
+        output = flash_attn_varlen_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
             self.dropout_p,
             softmax_scale=self.softmax_scale, causal=is_causal
@@ -418,7 +427,7 @@ class ParallelAttention(MegatronModule):
 
         self.use_flash_attn = args.use_flash_attn
         if self.use_flash_attn:
-            if flash_attn_unpadded_func is None:
+            if flash_attn_varlen_func is None:
                 raise ImportError('FlashAttention is not installed, please install with '
                                   'pip install flash-attn')
             assert attention_type == AttnType.self_attn, ('FlashAttention code path only supports '
@@ -528,6 +537,10 @@ class ParallelAttention(MegatronModule):
         # Pre-allocate memory for key-values for inference.
         # =================================================
         is_first_step = False
+        
+        torch.cuda.synchronize()
+        start_time = time.time()
+        
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
                 inf_max_seq_len = inference_params.max_sequence_len
@@ -542,6 +555,10 @@ class ParallelAttention(MegatronModule):
             else:
                 inference_key_memory, inference_value_memory = \
                     inference_params.key_value_memory_dict[self.layer_number]
+        
+        #torch.cuda.synchronize()
+        #end_time = time.time()
+        #print("***asycn all reduce time: ", end_time - start_time)
 
         # =====================
         # Query, Key, and Value
@@ -551,7 +568,7 @@ class ParallelAttention(MegatronModule):
             # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
             query_layer, key_layer, value_layer = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
-
+            
             # Changed layout, for compatibility with CKPT conversion
             new_tensor_shape = query_layer.size()[:-1] + \
                 (self.num_attention_heads_per_partition, self.hidden_size_per_attention_head)
@@ -654,6 +671,7 @@ class ParallelAttention(MegatronModule):
                 context_layer = self.core_attention(
                     query_layer, key_layer, value_layer, attention_mask)
         else:
+            # correct shape torch.Size([1, 4096, 32, 128])
             q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
                        for x in (query_layer, key_layer, value_layer)]
             if not self.sequence_parallel:
@@ -668,6 +686,10 @@ class ParallelAttention(MegatronModule):
         # =================
 
         output, bias = self.dense(context_layer)
+        
+        #torch.cuda.synchronize()
+        #end_time = time.time()
+        #print("*** parallel attn time: ", end_time - start_time)
 
         return output, bias
 

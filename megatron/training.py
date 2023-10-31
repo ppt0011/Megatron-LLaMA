@@ -155,14 +155,14 @@ def pretrain(train_valid_test_dataset_provider,
                           train_data_iterator, valid_data_iterator,
                           process_non_loss_data_func)
     print_datetime('after training is done')
-
+    '''
     if args.do_valid:
         prefix = 'the end of training for val data'
         evaluate_and_print_results(prefix, forward_step_func,
                                    valid_data_iterator, model,
                                    iteration, process_non_loss_data_func,
                                    False)
-
+    
     if args.save and iteration != 0:
         save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
 
@@ -173,6 +173,7 @@ def pretrain(train_valid_test_dataset_provider,
                                    test_data_iterator, model,
                                    0, process_non_loss_data_func,
                                    True)
+    '''
 
 def update_train_iters(args):
 
@@ -312,6 +313,38 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     return model
 
+'''
+def get_hf_configs(hf_config):
+    num_layers = getattr(hf_config, "num_hidden_layers",
+                         getattr(hf_config, "n_layer", None))
+    hidden_size = getattr(hf_config, "hidden_size",
+                          getattr(hf_config, "n_embd", None))
+    vocab_size = getattr(hf_config, "vocab_size", None)
+    assert all(
+        (num_layers, hidden_size, vocab_size)
+    ), "Could not determine number of layers, hidden size, and vocab size of the model"
+
+    return num_layers, hidden_size, vocab_size
+'''
+
+# Helper function to calculate FLOPs using the Megatron-LM paper's formula
+def calculate_flops(checkpoint_activations_factor, batch_size, seq_length,
+                    hf_config=None):
+    #num_layers, hidden_size, vocab_size = get_hf_configs(hf_config)
+    num_layers, hidden_size, vocab_size = 32, 4096, 32001
+    flops_per_iteration = (24 * checkpoint_activations_factor * batch_size *
+                           seq_length * num_layers * (hidden_size**2)) * (
+                               1.0 + (seq_length / (6.0 * hidden_size)) +
+                               (vocab_size /
+                                (16.0 * num_layers * hidden_size)))
+    '''
+    print("FLOPs per iteration: ", flops_per_iteration) #998047723028480.0
+    print("checkpoint_activations_factor: ", checkpoint_activations_factor) #4
+    print("batch_size: ", batch_size) # 4
+    print("seq_length: ", seq_length) # 4096
+    '''
+    return flops_per_iteration
+
 
 def get_optimizer_param_scheduler(optimizer):
     """Build the learning rate scheduler."""
@@ -373,7 +406,6 @@ def setup_model_and_optimizer(model_provider_func,
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
-
     optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
@@ -423,6 +455,7 @@ def train_step(forward_step_func, data_iterator,
     optimizer_for_forward_backward_func = \
         optimizer if args.overlapped_distributed_optimizer \
         else None
+    tensor_shape=(args.seq_length, args.micro_batch_size, args.hidden_size)
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
@@ -491,7 +524,7 @@ def train_step(forward_step_func, data_iterator,
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm, num_zeros_in_grad):
+                 grad_norm, params_norm, num_zeros_in_grad, model):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -661,6 +694,23 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
+        
+        # tflops
+        checkpoint_activations_factor = 4 if args.save else 3
+        #hf_config = model.config
+        # Megatron paper's formula to calculate training flops
+        train_flops_per_iteration = calculate_flops(
+            checkpoint_activations_factor, batch_size, args.seq_length)
+        gpus_per_model = torch.distributed.get_world_size()
+        train_tflops = train_flops_per_iteration / (elapsed_time_per_iteration * gpus_per_model *
+                                                    (10**12))
+        log_string += ' TFLOPS: {:.2f} |'.format(train_tflops)
+        
+        # throughput
+    
+        avg_throughput = int(args.global_batch_size) / elapsed_time_per_iteration
+        log_string += ' Throughput: {:.2f} samples/sec |'.format(avg_throughput)
+        
         print_rank_last(log_string)
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
@@ -704,85 +754,97 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
     report_memory_flag = True
-    while iteration < args.train_iters:
-        update_num_microbatches(args.consumed_train_samples)
-        args.curr_iteration = iteration
-        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
-            train_step(forward_step_func,
-                       train_data_iterator,
-                       model,
-                       optimizer,
-                       opt_param_scheduler)
-        iteration += 1
-        args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
-                                       args.micro_batch_size * \
-                                       get_num_microbatches()
 
-        # Logging.
-        loss_scale = optimizer.get_loss_scale().item()
-        params_norm = None
-        if args.log_params_norm:
-            params_norm = calc_params_l2_norm(model)
-        report_memory_flag = training_log(loss_dict, total_loss_dict,
-                                          optimizer.param_groups[0]['lr'],
-                                          iteration, loss_scale,
-                                          report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, num_zeros_in_grad)
+    with torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=2, warmup=3, active=5, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+    
+        while iteration < args.train_iters:
+            update_num_microbatches(args.consumed_train_samples)
+            args.curr_iteration = iteration
+            #prof.step()
+            if args.curr_iteration >= 2 + 3 + 5:
+                break
+            loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+                train_step(forward_step_func,
+                        train_data_iterator,
+                        model,
+                        optimizer,
+                        opt_param_scheduler)
+            iteration += 1
+            args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
+                                        args.micro_batch_size * \
+                                        get_num_microbatches()
 
-        # Autoresume
-        if args.adlr_autoresume and \
-           (iteration % args.adlr_autoresume_interval == 0):
-            check_adlr_autoresume_termination(iteration, model, optimizer,
-                                              opt_param_scheduler)
+            # Logging.
+            loss_scale = optimizer.get_loss_scale().item()
+            params_norm = None
+            if args.log_params_norm:
+                params_norm = calc_params_l2_norm(model)
+            report_memory_flag = training_log(loss_dict, total_loss_dict,
+                                            optimizer.param_groups[0]['lr'],
+                                            iteration, loss_scale,
+                                            report_memory_flag, skipped_iter,
+                                            grad_norm, params_norm, num_zeros_in_grad, model[0].module.module)
 
-        # Evaluation
-        if args.eval_interval and iteration % args.eval_interval == 0 and \
-           args.do_valid:
-            prefix = 'iteration {}'.format(iteration)
-            evaluate_and_print_results(prefix, forward_step_func,
-                                       valid_data_iterator, model,
-                                       iteration, process_non_loss_data_func,
-                                       False)
+            # Autoresume
+            if args.adlr_autoresume and \
+            (iteration % args.adlr_autoresume_interval == 0):
+                check_adlr_autoresume_termination(iteration, model, optimizer,
+                                                opt_param_scheduler)
 
-        # Checkpointing
-        saved_checkpoint = False
-        if args.exit_signal_handler:
-            signal_handler = get_signal_handler()
-            if any(signal_handler.signals_received()):
-                save_checkpoint_and_time(iteration, model, optimizer,
-                                         opt_param_scheduler)
-                print_datetime('exiting program after receiving SIGTERM.')
-                sys.exit()
+            # Evaluation
+            if args.eval_interval and iteration % args.eval_interval == 0 and \
+            args.do_valid:
+                prefix = 'iteration {}'.format(iteration)
+                evaluate_and_print_results(prefix, forward_step_func,
+                                        valid_data_iterator, model,
+                                        iteration, process_non_loss_data_func,
+                                        False)
 
-        if args.save and args.save_interval and \
-           iteration % args.save_interval == 0:
-            save_checkpoint_and_time(iteration, model, optimizer,
-                                     opt_param_scheduler)
-            saved_checkpoint = True
-
-        # Exiting based on duration
-        if args.exit_duration_in_mins:
-            train_time = (time.time() - _TRAIN_START_TIME) / 60.0
-            done_cuda = torch.cuda.IntTensor(
-                [train_time > args.exit_duration_in_mins])
-            torch.distributed.all_reduce(
-                done_cuda, op=torch.distributed.ReduceOp.MAX)
-            done = done_cuda.item()
-            if done:
-                if not saved_checkpoint:
+            # Checkpointing
+            saved_checkpoint = False
+            if args.exit_signal_handler:
+                signal_handler = get_signal_handler()
+                if any(signal_handler.signals_received()):
                     save_checkpoint_and_time(iteration, model, optimizer,
-                                             opt_param_scheduler)
-                print_datetime('exiting program after {} minutes'.format(train_time))
-                sys.exit()
+                                            opt_param_scheduler)
+                    print_datetime('exiting program after receiving SIGTERM.')
+                    sys.exit()
 
-        # Exiting based on iterations
-        if args.exit_interval and iteration % args.exit_interval == 0:
-            if args.save and not saved_checkpoint:
+            if args.save and args.save_interval and \
+            iteration % args.save_interval == 0:
                 save_checkpoint_and_time(iteration, model, optimizer,
-                                         opt_param_scheduler)
-            torch.distributed.barrier()
-            print_datetime('exiting program at iteration {}'.format(iteration))
-            sys.exit()
+                                        opt_param_scheduler)
+                saved_checkpoint = True
+
+            # Exiting based on duration
+            if args.exit_duration_in_mins:
+                train_time = (time.time() - _TRAIN_START_TIME) / 60.0
+                done_cuda = torch.cuda.IntTensor(
+                    [train_time > args.exit_duration_in_mins])
+                torch.distributed.all_reduce(
+                    done_cuda, op=torch.distributed.ReduceOp.MAX)
+                done = done_cuda.item()
+                if done:
+                    if not saved_checkpoint:
+                        save_checkpoint_and_time(iteration, model, optimizer,
+                                                opt_param_scheduler)
+                    print_datetime('exiting program after {} minutes'.format(train_time))
+                    sys.exit()
+
+            # Exiting based on iterations
+            if args.exit_interval and iteration % args.exit_interval == 0:
+                if args.save and not saved_checkpoint:
+                    save_checkpoint_and_time(iteration, model, optimizer,
+                                            opt_param_scheduler)
+                torch.distributed.barrier()
+                print_datetime('exiting program at iteration {}'.format(iteration))
+                sys.exit()
 
 
     return iteration

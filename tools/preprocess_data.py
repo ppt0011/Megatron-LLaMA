@@ -70,8 +70,13 @@ class Encoder(object):
         for key in self.args.json_keys:
             text = data[key]
             doc_ids = []
+            count = 1
             for sentence in Encoder.splitter.tokenize(text):
-                sentence_ids = Encoder.tokenizer.tokenize(sentence)
+                count += 1
+                try:
+                    sentence_ids = Encoder.tokenizer.tokenize(sentence)
+                except:
+                    continue
                 if len(sentence_ids) > 0:
                     doc_ids.append(sentence_ids)
             if len(doc_ids) > 0 and self.args.append_eod:
@@ -125,6 +130,8 @@ def get_args():
     group.add_argument('--chunk-size', type=int, required=True,
                        help='Chunk size assigned to each worker process')
     group.add_argument('--log-interval', type=int, default=100,
+                       help='Interval between progress updates')
+    group.add_argument('--tokenizer_name_or_path', type=str,
                        help='Interval between progress updates')
     args = parser.parse_args()
     args.keep_empty = False
