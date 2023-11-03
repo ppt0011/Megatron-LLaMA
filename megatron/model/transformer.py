@@ -263,6 +263,8 @@ class CoreAttention(MegatronModule):
 
         # [sq, b, np, hn] -> [sq, b * np, hn]
         
+        # *use the below reshape fn replacing view if you encounter error when turning off flash attn
+        
         query_layer = query_layer.view(output_size[2],
                                        output_size[0] * output_size[1], -1)
         # [sk, b, np, hn] -> [sk, b * np, hn]
@@ -275,6 +277,7 @@ class CoreAttention(MegatronModule):
         key_layer = key_layer.reshape(output_size[3],
                                    output_size[0] * output_size[1], -1)
         '''
+        
         # preallocting input tensor: [b * np, sq, sk]
         matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
             (output_size[0]*output_size[1], output_size[2], output_size[3]),
@@ -538,8 +541,8 @@ class ParallelAttention(MegatronModule):
         # =================================================
         is_first_step = False
         
-        torch.cuda.synchronize()
-        start_time = time.time()
+        #torch.cuda.synchronize()
+        #start_time = time.time()
         
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:

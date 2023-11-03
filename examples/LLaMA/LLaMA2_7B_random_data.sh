@@ -11,7 +11,7 @@ GLOBAL_BATCH_SIZE=$((($WORLD_SIZE * $MICRO_BATCH_SIZE) / ($TP_SIZE * $PP_SIZE) *
 LAYERS=32
 
 TIMESTAMP=$(date +%Y-%m-%d-%H-%M-%S)
-JOB_NAME="megatron_tp${TP_SIZE}_pp${PP_SIZE}_mbs${MICRO_BATCH_SIZE}_gpus${WORLD_SIZE}_layers${LAYERS}_code_sync_${TIMESTAMP}"
+JOB_NAME="megatron_tp${TP_SIZE}_pp${PP_SIZE}_mbs${MICRO_BATCH_SIZE}_gpus${WORLD_SIZE}_${TIMESTAMP}"
 
 LOAD_CHECKPOINT_PATH="/mnt/vepfs/lcxyc/model/Llama-2-7b-hf/"
 SAVE_CHECKPOINT_PATH="/mnt/vepfs/lcxpt/model/Llama-2-7b-mgt/interval"
@@ -92,4 +92,4 @@ options=" \
 # --use-rotary-position-embeddings
 
 
-CUDA_VISIBLE_DEVICES=3,4,5,7 torchrun --nproc_per_node=$WORLD_SIZE ~/share/Megatron-LLaMA/pretrain_llama.py ${options}
+torchrun --master-port 29600 --nproc_per_node=$WORLD_SIZE ~/share/Megatron-LLaMA/pretrain_llama.py ${options}

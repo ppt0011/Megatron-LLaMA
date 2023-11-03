@@ -766,7 +766,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         while iteration < args.train_iters:
             update_num_microbatches(args.consumed_train_samples)
             args.curr_iteration = iteration
-            #prof.step()
+            prof.step()
             if args.curr_iteration >= 2 + 3 + 5:
                 break
             loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
